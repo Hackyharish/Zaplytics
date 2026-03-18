@@ -615,6 +615,308 @@ static void Compute_CZT_Harmonics_I(float freq)
     snprintf(thd_line, sizeof(thd_line), "THD: %6.2f%%\r\n\r\n", (double)thd);
     UART_Print_IT(thd_line);
 }
+static void Process_Buffer(void)
+{
+    static float local_v[SAMPLE_COUNT];   /* voltage samples (float)          */
+    static float local_i[SAMPLE_COUNT];   /* current samples (float)          */
+
+    float bias_v = 0.0f, vrms = 0.0f;
+    float bias_i = 0.0f, irms = 0.0f;
+
+    /* ── 1. Snapshot and Split both channels instantly ── */
+    /* Unpack the DMA buffer: each 32-bit word = {ADC2[31:16], ADC1[15:0]}   */
+    for (uint32_t n = 0; n < SAMPLE_COUNT; n++)
+    {
+        local_v[n] = (float)(adc_dual_buf[n] & 0x0000FFFFU);         /* ADC1 */
+        local_i[n] = (float)((adc_dual_buf[n] >> 16) & 0x0000FFFFU); /* ADC2 */
+    }
+
+    /* ================================================================
+     * VOLTAGE CHANNEL
+     * ============================================================== */
+    {
+        /* ── 2a. DC Bias estimation (rolling extremes method) ── */
+        /* Maintain two small arrays tracking the N lowest and N highest
+         * samples. After a full scan:
+         *   bias = (mean_of_N_lowest + mean_of_N_highest) / 2
+         * This is more robust than a simple mean when the captured frame
+         * doesn't contain an integer number of complete cycles.              */
+        float low_vals[PEAK_AVG_COUNT], high_vals[PEAK_AVG_COUNT];
+        for (int j = 0; j < PEAK_AVG_COUNT; j++) low_vals[j] = high_vals[j] = local_v[j];
+
+        float low_max = low_vals[0], high_min = high_vals[0];
+        int   low_max_idx = 0, high_min_idx = 0;
+        for (int j = 1; j < PEAK_AVG_COUNT; j++)
+        {
+            if (low_vals[j]  > low_max)  { low_max  = low_vals[j];  low_max_idx  = j; }
+            if (high_vals[j] < high_min) { high_min = high_vals[j]; high_min_idx = j; }
+        }
+
+        for (uint32_t i = PEAK_AVG_COUNT; i < SAMPLE_COUNT; i++)
+        {
+            float s = local_v[i];
+            /* Keep the N lowest: replace current maximum in low_vals if s is smaller */
+            if (s < low_max)
+            {
+                low_vals[low_max_idx] = s; low_max = low_vals[0]; low_max_idx = 0;
+                for (int j = 1; j < PEAK_AVG_COUNT; j++)
+                    if (low_vals[j] > low_max) { low_max = low_vals[j]; low_max_idx = j; }
+            }
+            /* Keep the N highest: replace current minimum in high_vals if s is larger */
+            if (s > high_min)
+            {
+                high_vals[high_min_idx] = s; high_min = high_vals[0]; high_min_idx = 0;
+                for (int j = 1; j < PEAK_AVG_COUNT; j++)
+                    if (high_vals[j] < high_min) { high_min = high_vals[j]; high_min_idx = j; }
+            }
+        }
+
+        float low_avg_v = 0.0f, high_avg_v = 0.0f;
+        for (int j = 0; j < PEAK_AVG_COUNT; j++) { low_avg_v += low_vals[j]; high_avg_v += high_vals[j]; }
+        low_avg_v  /= (float)PEAK_AVG_COUNT;
+        high_avg_v /= (float)PEAK_AVG_COUNT;
+
+        bias_v  = (low_avg_v + high_avg_v) / 2.0f;  /* DC midpoint estimate  */
+        uint16_t min_v   = (uint16_t)low_avg_v;
+        uint16_t max_v   = (uint16_t)high_avg_v;
+
+        /* ── 2b. VRMS ── */
+        /* Compute RMS over the full frame using double precision accumulator
+         * to minimise floating-point rounding for large count sums.         */
+        double sum_sq_v = 0.0;
+        for (uint32_t i = 0; i < SAMPLE_COUNT; i++)
+        {
+            double raw = (double)(local_v[i] - bias_v);
+            sum_sq_v  += raw * raw;
+        }
+        float rms_counts_v = sqrtf((float)(sum_sq_v / (double)SAMPLE_COUNT));
+        vrms               = rms_counts_v * (VREF / ADC_RES) * CAL_FACTOR_V;
+
+        /* ── 2c. Zero-crossing frequency (voltage) ── */
+        /* Count positive-going zero crossings using a hysteresis band to
+         * suppress noise-induced false triggers near the DC bias.           */
+        float zc_high_v = bias_v + ZC_HYST_V;
+        float zc_low_v  = bias_v - ZC_HYST_V;
+        int   crossings_v = 0;
+        int   prev_sign_v = (local_v[0] > zc_high_v) ?  1 : (local_v[0] < zc_low_v)  ? -1 : 0;
+        for (uint32_t i = 1; i < SAMPLE_COUNT; i++)
+        {
+            int cur;
+            if      (local_v[i] > zc_high_v) cur =  1;
+            else if (local_v[i] < zc_low_v)  cur = -1;
+            else                             cur =  prev_sign_v;   /* inside hysteresis band */
+            if (prev_sign_v == -1 && cur == 1) crossings_v++;      /* rising edge detected  */
+            prev_sign_v = cur;
+        }
+        /* freq = (positive crossings / frame) × sample_rate
+         * = number of complete cycles per second = fundamental frequency     */
+        float freq_v = (crossings_v > 0)
+                     ? ((float)crossings_v * SAMPLE_RATE / (float)SAMPLE_COUNT)
+                     : (float)FUNDAMENTAL_HZ;   /* Fallback if no crossings found */
+
+        /* Print voltage summary line */
+        {
+            char msg[128];
+            snprintf(msg, sizeof(msg),
+                     "[V] Min:%4u Max:%4u Pk-Pk:%4u Bias:%.1f Freq:%.2fHz VRMS:%.4fV\r\n",
+                     (unsigned)min_v, (unsigned)max_v, (unsigned)(max_v - min_v),
+                     (double)bias_v, (double)freq_v, (double)vrms);
+            UART_Print_IT(msg);
+        }
+
+        /* ── 2d. CZT + harmonic report ── */
+        CZT_Compute_From_Buffer(local_v, bias_v, hann_win_v);
+        Compute_CZT_Harmonics_V(freq_v);
+    }
+
+    /* ================================================================
+     * CURRENT CHANNEL
+     * ============================================================== */
+    {
+        /* Same peak-averaging bias estimator as the voltage channel         */
+        float low_vals[PEAK_AVG_COUNT], high_vals[PEAK_AVG_COUNT];
+        for (int j = 0; j < PEAK_AVG_COUNT; j++) low_vals[j] = high_vals[j] = local_i[j];
+
+        float low_max = low_vals[0], high_min = high_vals[0];
+        int   low_max_idx = 0, high_min_idx = 0;
+        for (int j = 1; j < PEAK_AVG_COUNT; j++)
+        {
+            if (low_vals[j]  > low_max)  { low_max  = low_vals[j];  low_max_idx  = j; }
+            if (high_vals[j] < high_min) { high_min = high_vals[j]; high_min_idx = j; }
+        }
+
+        for (uint32_t i = PEAK_AVG_COUNT; i < SAMPLE_COUNT; i++)
+        {
+            float s = local_i[i];
+            if (s < low_max)
+            {
+                low_vals[low_max_idx] = s; low_max = low_vals[0]; low_max_idx = 0;
+                for (int j = 1; j < PEAK_AVG_COUNT; j++)
+                    if (low_vals[j] > low_max) { low_max = low_vals[j]; low_max_idx = j; }
+            }
+            if (s > high_min)
+            {
+                high_vals[high_min_idx] = s; high_min = high_vals[0]; high_min_idx = 0;
+                for (int j = 1; j < PEAK_AVG_COUNT; j++)
+                    if (high_vals[j] < high_min) { high_min = high_vals[j]; high_min_idx = j; }
+            }
+        }
+
+        float low_avg_i = 0.0f, high_avg_i = 0.0f;
+        for (int j = 0; j < PEAK_AVG_COUNT; j++) { low_avg_i += low_vals[j]; high_avg_i += high_vals[j]; }
+        low_avg_i  /= (float)PEAK_AVG_COUNT;
+        high_avg_i /= (float)PEAK_AVG_COUNT;
+
+        bias_i  = (low_avg_i + high_avg_i) / 2.0f;
+        uint16_t min_i   = (uint16_t)low_avg_i;
+        uint16_t max_i   = (uint16_t)high_avg_i;
+
+        /* ── IRMS ── */
+        double sum_sq_i = 0.0;
+        for (uint32_t i = 0; i < SAMPLE_COUNT; i++)
+        {
+            double raw = (double)(local_i[i] - bias_i);
+            sum_sq_i  += raw * raw;
+        }
+        float rms_counts_i = sqrtf((float)(sum_sq_i / (double)SAMPLE_COUNT));
+        irms               = COUNTS_TO_AMPS(rms_counts_i);   /* RMS amperes   */
+
+        /* Diagnostic voltages for calibration verification:
+         *   v_adc_bias   = bias ADC count → voltage at the ADC pin
+         *   v_sens_bias  = voltage at the sensor output (before divider)
+         *   v0g_expected = V0G derived from the stored calibration count     */
+        float v_adc_bias   = bias_i       * (VREF / ADC_RES);
+        float v_sens_bias  = v_adc_bias   / DIVIDER_RATIO;
+        float v0g_expected = V0G_COUNTS_CAL * (VREF / ADC_RES);
+
+        /* ── Zero-crossing frequency (current) ── */
+        float zc_high_i = bias_i + ZC_HYST_I;
+        float zc_low_i  = bias_i - ZC_HYST_I;
+        int   crossings_i = 0;
+        int   prev_sign_i = (local_i[0] > zc_high_i) ?  1 : (local_i[0] < zc_low_i)  ? -1 : 0;
+        for (uint32_t i = 0; i < SAMPLE_COUNT; i++)
+        {
+            int cur;
+            if      (local_i[i] > zc_high_i) cur =  1;
+            else if (local_i[i] < zc_low_i)  cur = -1;
+            else                             cur =  prev_sign_i;
+            if (prev_sign_i == -1 && cur == 1) crossings_i++;
+            prev_sign_i = cur;
+        }
+        float freq_i = (crossings_i > 0)
+                     ? ((float)crossings_i * SAMPLE_RATE / (float)SAMPLE_COUNT)
+                     : (float)FUNDAMENTAL_HZ;
+
+        /* Print current summary line (includes calibration diagnostics)     */
+        {
+            char msg[192];
+            snprintf(msg, sizeof(msg),
+                     "[I] Bias:%4u | V_adc=%.3fV V_sens=%.3fV V0G_cal=%.3fV | "
+                     "PkPk:%4u | Freq:%.2fHz | IRMS:%.4fA\r\n",
+                     (unsigned)(uint16_t)bias_i, (double)v_adc_bias, (double)v_sens_bias,
+                     (double)v0g_expected, (unsigned)(max_i - min_i), (double)freq_i, (double)irms);
+            UART_Print_IT(msg);
+        }
+
+        /* ── CZT + harmonic report (rectangular window) ── */
+        CZT_Compute_From_Buffer(local_i, bias_i, rect_win_i);
+        Compute_CZT_Harmonics_I(freq_i);
+    }
+
+    /* ================================================================
+     * TOTAL POWER & PHASE ANGLE CALCULATION
+     * ============================================================== */
+    {
+        /* Active (real) power via instantaneous power averaging:
+         *   P = (1/N) Σ_{i=0}^{N-1}  v_inst[i] · i_inst[i]
+         * This is the true fundamental + all-harmonic active power.         */
+        double sum_p = 0.0;
+
+        for (uint32_t i = 0; i < SAMPLE_COUNT; i++)
+        {
+            /* Convert each raw ADC count (bias-removed) to physical units   */
+            float v_inst = (local_v[i] - bias_v) * (VREF / ADC_RES) * CAL_FACTOR_V;
+            float i_inst = COUNTS_TO_AMPS(local_i[i] - bias_i);
+            sum_p += (double)(v_inst * i_inst);
+        }
+
+        float active_power   = (float)(sum_p / (double)SAMPLE_COUNT);   /* Watts */
+        float apparent_power = vrms * irms;                              /* VA    */
+
+        float power_factor    = 0.0f;
+        float phase_angle_deg = 0.0f;
+
+        if (apparent_power > 0.001f)
+        {
+            power_factor = active_power / apparent_power;
+
+            /* Clamp to [-1, 1] to guard against small floating-point overshoots
+             * that would make acosf() return NaN                             */
+            if (power_factor > 1.0f) power_factor = 1.0f;
+            else if (power_factor < -1.0f) power_factor = -1.0f;
+
+            /* φ = arccos(PF) — displacement angle between V and I fundamentals */
+            phase_angle_deg = acosf(power_factor) * 180.0f / (float)M_PI;
+        }
+
+        char pwr_msg[128];
+        snprintf(pwr_msg, sizeof(pwr_msg),
+                 "[PWR] Active: %7.2f W | Apparent: %7.2f VA | PF: %5.3f | Phase: %5.1f deg\r\n",
+                 (double)active_power, (double)apparent_power,
+                 (double)power_factor, (double)phase_angle_deg);
+        UART_Print_IT(pwr_msg);
+
+        /* ================================================================
+         * OLED DISPLAY UPDATE
+         * ============================================================== */
+        /* Only update the display if the SSD1306 I2C DMA is idle.
+         * SSD1306_IsReady() returns false while a previous frame transfer
+         * is still in progress, preventing I2C bus contention.             */
+        if (SSD1306_IsReady())
+        {
+            char oled_v[32];
+            char oled_i[32];
+            char oled_p[32];
+            char oled_pf[32];
+
+            snprintf(oled_v,  sizeof(oled_v),  "Vrms : %.1f V", (double)vrms);
+            snprintf(oled_i,  sizeof(oled_i),  "Irms : %.2f A", (double)irms);
+            snprintf(oled_p,  sizeof(oled_p),  "Power: %.1f W", (double)active_power);
+            snprintf(oled_pf, sizeof(oled_pf), "PF   : %.2f",   (double)power_factor);
+
+            SSD1306_Clear();
+
+            /* Page 0: Title */
+            SSD1306_WriteString(0, 0, "-- Power Monitor --");
+
+            /* Pages 2 & 3: Voltage and Current */
+            SSD1306_WriteString(0, 2, oled_v);
+            SSD1306_WriteString(0, 3, oled_i);
+
+            /* Pages 5 & 6: Power and Power Factor */
+            SSD1306_WriteString(0, 5, oled_p);
+            SSD1306_WriteString(0, 6, oled_pf);
+
+            SSD1306_UpdateScreen();
+        }
+    }
+
+    /* Single flush — kicks off IT transfer for the whole assembled frame    */
+    UART_Print_IT("----------------------------------------\r\n");
+    UART_Flush_IT();
+
+    /* ── FIX: Clear Hardware Overrun flags before re-arming ── */
+    /* ADC overrun (OVR) occurs when a new conversion completes before the
+     * previous result was read. Clearing OVR here prevents the next DMA
+     * capture from being suppressed by a stale overrun condition.           */
+    __HAL_ADC_CLEAR_FLAG(&hadc1, ADC_FLAG_OVR);
+    __HAL_ADC_CLEAR_FLAG(&hadc2, ADC_FLAG_OVR);
+
+    /* ── Re-arm DMA ── */
+    /* Restart dual simultaneous ADC DMA capture for the next frame.
+     * TIM1 TRGO continues running so conversion timing is uninterrupted.   */
+    HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)adc_dual_buf, SAMPLE_COUNT);
+}
 /* USER CODE END 0 */
 
 /**
