@@ -1,5 +1,12 @@
 # Zaplytics — CZT Harmonic Power Analyser
 
+![STM32](https://img.shields.io/badge/STM32-G474RE-03234B?logo=stmicroelectronics&logoColor=white)
+![C](https://img.shields.io/badge/Language-C-blue?logo=c)
+![Platform](https://img.shields.io/badge/Platform-Embedded-green)
+![License](https://img.shields.io/badge/License-MIT-yellow)
+![Status](https://img.shields.io/badge/Status-Complete-brightgreen)
+![DSP](https://img.shields.io/badge/Algorithm-CZT-purple)
+
 > A real-time embedded power quality analyser on the **STM32G474RE** (ARM Cortex-M4 @ 170 MHz) that simultaneously measures mains voltage and current, extracts harmonics H1–H10 using the **Chirp Z-Transform (CZT)**, and reports THD, active power, apparent power, and power factor — every 100 ms.
 
 ---
@@ -17,13 +24,12 @@
 
 ### Team Members
 
-| Name |
+| Name | GitHub | LinkedIn |
 |---|---|---|
-| Gopika Gokul |
-| Anmol Govindarajapuram Krishnan | 
-| Harish R | 
-| Mauli Rajguru | 
-
+| Gopika Gokul | [GitHub](https://github.com/gopika-777) | [LinkedIn](https://www.linkedin.com/in/gopika-gokul)|
+| Anmol Govindarajapuram Krishnan | [GitHub](https://github.com/Anmol-G-K) | [LinkedIn](https://www.linkedin.com/in/anmolkrish/) |
+| Harish R | [GitHub](https://github.com/Hackyharish) | [LinkedIn](https://www.linkedin.com/in/harish-r-8b68a333b/) |
+| Mauli Rajguru | [GitHub](https://github.com/maulirajguru) | [LinkedIn](https://www.linkedin.com/in/maulir/) |
 ---
 
 ##  What It Does
