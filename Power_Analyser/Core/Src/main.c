@@ -364,7 +364,257 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
      * TIM1 TRGO continues running so conversion timing is uninterrupted.   */
     HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)adc_dual_buf, SAMPLE_COUNT);
 }
+/* ── Find_Peak_Bin ───────────────────────────────────────────────────────── */
+/**
+ * @brief  Locate the CZT magnitude peak near an expected harmonic bin.
+ *
+ *         Searches the czt_mag[] array within ±SEARCH_BINS of expected_bin
+ *         and returns the index of the largest magnitude value. This
+ *         compensates for small mains frequency deviations (e.g. 49.8 Hz
+ *         instead of exactly 50 Hz) without requiring a PLL.
+ *
+ * @param  expected_bin  Ideal bin index for this harmonic (= f_h / CZT_FREQ_RES).
+ * @return Index of the highest-magnitude bin in the search window.
+ */
+static int Find_Peak_Bin(int expected_bin)
+{
+    int start = expected_bin - (int)SEARCH_BINS;
+    int end   = expected_bin + (int)SEARCH_BINS;
+    if (start < 0)                start = 0;
+    if (end >= (int)SAMPLE_COUNT) end   = (int)SAMPLE_COUNT - 1;
 
+    int   peak_bin = expected_bin;
+    float peak_val = 0.0f;
+    for (int k = start; k <= end; k++)
+        if (czt_mag[k] > peak_val) { peak_val = czt_mag[k]; peak_bin = k; }
+    return peak_bin;
+}
+
+/* ── CZT_Init ────────────────────────────────────────────────────────────── */
+/**
+ * @brief  Pre-compute all fixed CZT tables and window coefficients.
+ *
+ *         Must be called once during initialisation before any call to
+ *         CZT_Compute_From_Buffer(). Populates:
+ *
+ *           hann_win_v[n]  = 0.5·(1 − cos(2π·n/N))   Hann window
+ *           rect_win_i[n]  = 1.0                       Rectangular window
+ *           tw_n_re/im[n]  = exp(−j·C·n²)              Input twiddle factors
+ *           kern_re/im[m]  = exp(+j·C·m²)              Kernel (m = −N+1…N−1)
+ *
+ *         where C = π·Δf / (N·fs).
+ */
+static void CZT_Init(void)
+{
+    const float C   = CZT_C;
+    const float pi2 = 2.0f * (float)M_PI;
+
+    for (uint32_t n = 0; n < SAMPLE_COUNT; n++)
+    {
+        /* Hann window: reduces spectral leakage for voltage analysis        */
+        hann_win_v[n] = 0.5f * (1.0f - cosf(pi2 * (float)n / (float)SAMPLE_COUNT));
+
+        /* Rectangular window: unity weights, no leakage suppression         */
+        rect_win_i[n] = 1.0f;
+
+        /* Input chirp twiddle: tw[n] = exp(−jCn²)                          */
+        float angle  = C * (float)(n * n);
+        tw_n_re[n]   =  cosf(angle);
+        tw_n_im[n]   = -sinf(angle);
+    }
+
+    /* Kernel chirp: kern[m] = exp(+jCm²) for m = -(N-1) … +(N-1).
+     * Index mapping: kern_re/im[m + (N-1)] stores the value for offset m.  */
+    for (int32_t m = -(int32_t)(SAMPLE_COUNT - 1U); m <=  (int32_t)(SAMPLE_COUNT - 1U); m++)
+    {
+        float    angle = C * (float)(m * m);
+        uint32_t idx   = (uint32_t)(m + (int32_t)(SAMPLE_COUNT - 1U));
+        kern_re[idx]   =  cosf(angle);
+        kern_im[idx]   =  sinf(angle);
+    }
+}
+
+/* ── CZT_Compute_From_Buffer ─────────────────────────────────────────────── */
+/**
+ * @brief  Compute the Chirp Z-Transform magnitude spectrum from a raw buffer.
+ *
+ *         Implements Bluestein's (chirp-z) algorithm in three steps:
+ *
+ *         Step 1 — Window + twiddle multiply:
+ *           g[n] = win[n] · (buf[n] − bias) · exp(−jCn²)
+ *
+ *         Step 2 — Direct O(N²) convolution with the kernel exp(+jCm²):
+ *           G[k] = Σ_{n=0}^{N-1}  g[n] · kern[N−1+k−n]
+ *
+ *         Step 3 — Output twiddle multiply + magnitude:
+ *           X[k] = G[k] · exp(−jCk²)
+ *           czt_mag[k] = (2/N) · |X[k]|
+ *
+ *         The factor 2/N normalises the single-sided spectrum so that each
+ *         bin directly represents the peak sinusoidal amplitude in the
+ *         same units as the input (ADC counts after bias removal).
+ *
+ * @param  buf   Pointer to SAMPLE_COUNT float samples (raw ADC counts).
+ * @param  bias  DC offset to subtract before processing (ADC counts).
+ * @param  win   Pointer to the SAMPLE_COUNT-length window array.
+ *
+ * @note   Result is written to the module-global czt_mag[] array.
+ *         This function takes ~40 ms at 170 MHz for N=1000 (O(N²)).
+ */
+static void CZT_Compute_From_Buffer(const float *buf, float bias, const float *win)
+{
+    const float scale = 2.0f / (float)SAMPLE_COUNT;
+
+    /* Step 1: Window, remove DC bias, apply input chirp twiddle             */
+    for (uint32_t n = 0; n < SAMPLE_COUNT; n++)
+    {
+        float xn = win[n] * (buf[n] - bias);   /* windowed, DC-removed sample */
+        g_re[n]  = xn * tw_n_re[n];
+        g_im[n]  = xn * tw_n_im[n];
+    }
+
+    /* Step 2: Direct convolution; Step 3: Output twiddle + magnitude        */
+    for (uint32_t k = 0; k < SAMPLE_COUNT; k++)
+    {
+        float acc_re = 0.0f, acc_im = 0.0f;
+
+        /* Convolve g[] with the chirp kernel at output bin k                */
+        for (uint32_t n = 0; n < SAMPLE_COUNT; n++)
+        {
+            uint32_t kidx = (SAMPLE_COUNT - 1U) + k - n;   /* kernel index   */
+            float    kr_n = kern_re[kidx];
+            float    ki_n = kern_im[kidx];
+            /* Complex multiply-accumulate: (g_re + j·g_im)(kr + j·ki)      */
+            acc_re += g_re[n] * kr_n - g_im[n] * ki_n;
+            acc_im += g_re[n] * ki_n + g_im[n] * kr_n;
+        }
+
+        /* Apply output twiddle exp(−jCk²) and compute magnitude             */
+        float xfin_re = acc_re * tw_n_re[k] - acc_im * tw_n_im[k];
+        float xfin_im = acc_re * tw_n_im[k] + acc_im * tw_n_re[k];
+        czt_mag[k]    = scale * sqrtf(xfin_re * xfin_re + xfin_im * xfin_im);
+    }
+}
+
+/* ── Compute_CZT_Harmonics_V ─────────────────────────────────────────────── */
+/**
+ * @brief  Read harmonic amplitudes from czt_mag[] and report voltage THD.
+ *
+ *         For each harmonic H1…H10 (50 Hz, 100 Hz, … 500 Hz):
+ *           1. Compute the ideal CZT bin index  k = round(h·50 / 0.5)
+ *           2. Call Find_Peak_Bin() to track small frequency deviations
+ *           3. Convert peak magnitude from ADC counts to true RMS volts:
+ *              V_peak[h] = czt_mag[k_peak] × (Vref / ADC_RES) × CAL_FACTOR_V
+ *           4. Accumulate Σ(V²) for harmonics H2–H10
+ *
+ *         THD(%) = 100 × sqrt(ΣH2…H10 V²) / V_H1
+ *
+ *         Results are printed to the UART write buffer via UART_Print_IT().
+ *
+ * @param  freq  Measured fundamental frequency (Hz) for the header line.
+ *
+ * @note   Assumes CZT_Compute_From_Buffer() has already been called for the
+ *         voltage channel so that czt_mag[] is populated.
+ */
+static void Compute_CZT_Harmonics_V(float freq)
+{
+    float amplitudes[NUM_HARMONICS];
+    float sum_sq_h = 0.0f;          /* Accumulates Σ(V_h²) for h = 2…10    */
+
+    /* Print channel header with measured fundamental and frequency resolution */
+    {
+        char hdr[80];
+        snprintf(hdr, sizeof(hdr),
+                 "[V] CZT Harmonics (fund=%.2fHz  fR=%.4fHz)\r\n",
+                 (double)freq, (double)CZT_FREQ_RES);
+        UART_Print_IT(hdr);
+    }
+
+    for (uint8_t h = 1; h <= NUM_HARMONICS; h++)
+    {
+        float f_h     = (float)(h * FUNDAMENTAL_HZ);               /* Target frequency    */
+        int   k_ideal = (int)(f_h / CZT_FREQ_RES + 0.5f);          /* Nearest ideal bin   */
+        int   k_peak  = Find_Peak_Bin(k_ideal);                     /* Best actual bin     */
+
+        /* Convert CZT magnitude (ADC counts peak) → volts peak → note: czt_mag
+         * is already scaled by 2/N so it represents peak amplitude directly */
+        float amp_v   = czt_mag[k_peak] * (VREF / ADC_RES) * CAL_FACTOR_V;
+
+        amplitudes[h - 1] = amp_v;
+        if (h > 1) sum_sq_h = fmaf(amp_v, amp_v, sum_sq_h);   /* Sum harmonic power */
+
+        char line[64];
+        snprintf(line, sizeof(line), "H%02u (%4uHz): %7.4fV  [bin %3d]\r\n",
+                 (unsigned)h, (unsigned)(h * FUNDAMENTAL_HZ), (double)amp_v, k_peak);
+        UART_Print_IT(line);
+    }
+
+    /* THD = 100% × √(Σ H2-H10 amplitudes²) / H1 amplitude                  */
+    float h1  = amplitudes[0];
+    float thd = (h1 > 1e-9f) ? (100.0f * sqrtf(sum_sq_h) / h1) : 0.0f;
+
+    char thd_line[48];
+    snprintf(thd_line, sizeof(thd_line), "THD: %6.2f%%\r\n\r\n", (double)thd);
+    UART_Print_IT(thd_line);
+}
+
+/* ── Compute_CZT_Harmonics_I ─────────────────────────────────────────────── */
+/**
+ * @brief  Read harmonic amplitudes from czt_mag[] and report current THD.
+ *
+ *         Identical harmonic search logic to Compute_CZT_Harmonics_V() but
+ *         converts magnitudes to amperes (RMS) using COUNTS_TO_AMPS() and
+ *         divides by √2 to obtain the RMS value of each sinusoidal component.
+ *
+ *         For each harmonic H1…H10:
+ *           I_rms[h] = COUNTS_TO_AMPS(czt_mag[k_peak]) / √2
+ *
+ *         THD(%) = 100 × sqrt(ΣH2…H10 I_rms²) / I_rms_H1
+ *
+ * @param  freq  Measured fundamental frequency (Hz) for the header line.
+ *
+ * @note   Assumes CZT_Compute_From_Buffer() has been called for the current
+ *         channel (rectangular window) and czt_mag[] is freshly populated.
+ */
+static void Compute_CZT_Harmonics_I(float freq)
+{
+    float amplitudes_a[NUM_HARMONICS];
+    float sum_sq_h = 0.0f;          /* Accumulates Σ(I_rms_h²) for h = 2…10 */
+
+    {
+        char hdr[80];
+        snprintf(hdr, sizeof(hdr),
+                 "[I] CZT Harmonics (fund=%.2fHz  fR=%.4fHz)\r\n",
+                 (double)freq, (double)CZT_FREQ_RES);
+        UART_Print_IT(hdr);
+    }
+
+    for (uint8_t h = 1; h <= NUM_HARMONICS; h++)
+    {
+        float f_h     = (float)(h * FUNDAMENTAL_HZ);
+        int   k_ideal = (int)(f_h / CZT_FREQ_RES + 0.5f);
+        int   k_peak  = Find_Peak_Bin(k_ideal);
+
+        /* czt_mag gives peak amplitude in ADC counts → convert to A peak
+         * → divide by √2 to get RMS for a pure sinusoid                    */
+        float amp_arms = COUNTS_TO_AMPS(czt_mag[k_peak]) / 1.4142136f;
+
+        amplitudes_a[h - 1] = amp_arms;
+        if (h > 1) sum_sq_h = fmaf(amp_arms, amp_arms, sum_sq_h);
+
+        char line[72];
+        snprintf(line, sizeof(line), "H%02u (%4uHz): %7.4fA rms  [bin %3d]\r\n",
+                 (unsigned)h, (unsigned)(h * FUNDAMENTAL_HZ), (double)amp_arms, k_peak);
+        UART_Print_IT(line);
+    }
+
+    float h1  = amplitudes_a[0];
+    float thd = (h1 > 1e-6f) ? (100.0f * sqrtf(sum_sq_h) / h1) : 0.0f;
+
+    char thd_line[48];
+    snprintf(thd_line, sizeof(thd_line), "THD: %6.2f%%\r\n\r\n", (double)thd);
+    UART_Print_IT(thd_line);
+}
 /* USER CODE END 0 */
 
 /**
