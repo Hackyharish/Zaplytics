@@ -26,7 +26,7 @@
 
 | Name | GitHub | LinkedIn |
 |---|---|---|
-| Gopika Gokul | [GitHub](https://github.com/gopika-777) | [LinkedIn](https://www.linkedin.com/in/gopika-gokul)|
+| Gopika Gokul | [GitHub](https://github.com/gopika-777) | [LinkedIn](https://www.linkedin.com/in/gopika-gokul-773201351/)|
 | Anmol Govindarajapuram Krishnan | [GitHub](https://github.com/Anmol-G-K) | [LinkedIn](https://www.linkedin.com/in/anmolkrish/) |
 | Harish R | [GitHub](https://github.com/Hackyharish) | [LinkedIn](https://www.linkedin.com/in/harish-r-8b68a333b/) |
 | Mauli Rajguru | [GitHub](https://github.com/maulirajguru) | [LinkedIn](https://www.linkedin.com/in/maulir/) |
