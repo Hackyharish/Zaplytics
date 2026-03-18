@@ -168,21 +168,57 @@ TIM_HandleTypeDef htim1;
 
 /* USER CODE BEGIN PV */
 /* ── ADC DMA buffer ─────────────────────────────────────────────────────── */
+/* Each 32-bit word stores one simultaneous sample pair:
+ *   bits[15: 0] = ADC1 result (voltage)
+ *   bits[31:16] = ADC2 result (current)
+ * The DMA reads from ADC12_CDR (the dual-mode common data register).       */
 static uint32_t  adc_dual_buf[SAMPLE_COUNT];
+
+/* Flag raised by HAL_ADC_ConvCpltCallback; cleared by the main loop.       */
 volatile uint8_t capture_done = 0;
 
-/* ── CZT arrays  ──────────────────────── */
+/* ── CZT pre-computed twiddle tables ────────────────────────────────────── */
+/* tw_n_re[n] = cos(C·n²),  tw_n_im[n] = -sin(C·n²)  for n = 0…N-1.
+ * These are the "chirp multiplier" values applied to the input sequence
+ * before the convolution step of the CZT.                                  */
 static float tw_n_re[SAMPLE_COUNT];
 static float tw_n_im[SAMPLE_COUNT];
+
+/* kern_re/im[m] = cos/sin(C·m²) for m = -(N-1)…+(N-1) (length = KERN_LEN).
+ * This is the CZT convolution kernel; only the real part differs in sign
+ * from tw_n because the kernel uses +sin (conjugate twiddle).              */
 static float kern_re[KERN_LEN];
 static float kern_im[KERN_LEN];
+
+/* ── Analysis windows ───────────────────────────────────────────────────── */
+/* hann_win_v: Hann window for the voltage channel.
+ *   Reduces spectral leakage — important for measuring harmonic amplitudes
+ *   accurately when the signal frequency is not exactly bin-centred.       */
 static float hann_win_v[SAMPLE_COUNT];
+
+/* rect_win_i: Rectangular (unity) window for the current channel.
+ *   Preserves waveform amplitude at the cost of higher leakage. Chosen for
+ *   the current channel where edge discontinuities are less of a concern
+ *   and peak amplitude accuracy matters more.                              */
 static float rect_win_i[SAMPLE_COUNT];
+
+/* ── CZT intermediate and output arrays ────────────────────────────────── */
+/* g_re / g_im: Input sequence after windowing + twiddle multiplication;
+ *   used as the input to the O(N²) direct convolution loop.               */
 static float g_re[SAMPLE_COUNT];
 static float g_im[SAMPLE_COUNT];
+
+/* czt_mag[k]: Magnitude spectrum in ADC counts for bin k (0–N-1),
+ *   covering 0 Hz to CZT_DELTA_F (500 Hz) with 0.5 Hz resolution.        */
 static float czt_mag[SAMPLE_COUNT];
 
-/* ── UART ping-pong TX buffers ──────────────────────────────────────────── */
+/* ── Interrupt-driven UART ping-pong buffers ────────────────────────────── */
+/* Two TX buffers allow the assembler (main loop) to write into one buffer
+ * while HAL_UART_Transmit_IT() drains the other asynchronously.
+ *
+ *   tx_write_idx : buffer currently being filled by UART_Print_IT()
+ *   tx_read_idx  : buffer currently being transmitted
+ *   tx_busy      : non-zero while a HAL UART IT transfer is in progress   */
 static uint8_t          tx_buf[2][TX_BUF_SIZE];
 static uint16_t         tx_len[2]      = {0, 0};
 static uint8_t          tx_write_idx   = 0;
@@ -201,15 +237,10 @@ static void MX_ADC2_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_RTC_Init(void);
 /* USER CODE BEGIN PFP */
-/* ── UART  ── */
 static void UART_Print_IT(const char *msg);
 static void UART_Flush_IT(void);
 void        HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart);
-
-/* ── ADC  ── */
 void        HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc);
-
-/* ── Needed by shared Process_Buffer ── */
 void        HAL_I2C_MasterTxCpltCallback(I2C_HandleTypeDef *hi2c);
 static int  Find_Peak_Bin(int expected_bin);
 static void CZT_Init(void);
@@ -234,136 +265,107 @@ void HAL_I2C_MasterTxCpltCallback(I2C_HandleTypeDef *hi2c)
     SSD1306_TxCpltCallback(hi2c);
 }
 
-
-
-/* ════════════════════════════════════════════════════════════════════════
- * UART PING-PONG TX SYSTEM
- * ════════════════════════════════════════════════════════════════════════ */
-
+/* ── UART_Print_IT ───────────────────────────────────────────────────────── */
 /**
- * @brief  Append a string to the active write buffer (non-blocking).
+ * @brief  Append a null-terminated string to the active write buffer.
+ *
+ *         This function is non-blocking: it copies the string into the
+ *         current ping-pong write buffer. The actual UART transmission is
+ *         started only when UART_Flush_IT() is called.
+ *
+ *         If the string would overflow the buffer (TX_BUF_SIZE bytes) it is
+ *         silently discarded to avoid memory corruption.
+ *
+ * @param  msg  Null-terminated ASCII string to queue.
  */
 static void UART_Print_IT(const char *msg)
 {
     uint16_t len  = (uint16_t)strlen(msg);
     uint16_t used = tx_len[tx_write_idx];
-    if (used + len > TX_BUF_SIZE) return;
+    if (used + len > TX_BUF_SIZE) return;   /* Drop if buffer would overflow  */
     memcpy(&tx_buf[tx_write_idx][used], msg, len);
     tx_len[tx_write_idx] = used + len;
 }
 
+/* ── UART_Flush_IT ───────────────────────────────────────────────────────── */
 /**
- * @brief  Swap ping-pong buffers and start interrupt-driven UART TX.
+ * @brief  Commit the current write buffer to the UART TX interrupt engine.
+ *
+ *         Swaps write and read indices so the filled buffer becomes the
+ *         "transmit" buffer and the previously transmitted buffer (now
+ *         empty) becomes the new write buffer. If UART is already busy the
+ *         new data will be picked up automatically in TxCpltCallback.
+ *
+ *         Safe to call from the main loop only (not from ISR context).
  */
 static void UART_Flush_IT(void)
 {
-    if (tx_len[tx_write_idx] == 0) return;
+    if (tx_len[tx_write_idx] == 0) return;   /* Nothing to send              */
 
     if (!tx_busy)
     {
+        /* Swap buffers: promote write → read, clear the new write buffer    */
         tx_read_idx          = tx_write_idx;
         tx_write_idx         = tx_write_idx ^ 1U;
         tx_len[tx_write_idx] = 0;
         tx_busy = 1;
-        HAL_UART_Transmit_IT(&hlpuart1,
-                             tx_buf[tx_read_idx],
-                             tx_len[tx_read_idx]);
+        HAL_UART_Transmit_IT(&hlpuart1, tx_buf[tx_read_idx], tx_len[tx_read_idx]);
     }
 }
 
+/* ── HAL_UART_TxCpltCallback ─────────────────────────────────────────────── */
 /**
- * @brief  UART TX-complete callback — auto-chains next buffer if pending.
+ * @brief  UART TX-complete interrupt callback.
+ *
+ *         Called by HAL when the interrupt-driven UART transfer finishes.
+ *         Checks whether the other ping-pong buffer has accumulated data
+ *         while transmission was in progress and, if so, starts the next
+ *         transfer immediately to avoid gaps.
+ *
+ * @param  huart  Handle of the UART peripheral that triggered the callback.
  */
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance != LPUART1) return;
 
-    tx_len[tx_read_idx] = 0;
+    tx_len[tx_read_idx] = 0;   /* Mark just-sent buffer as empty             */
 
     uint8_t next = tx_read_idx ^ 1U;
     if (tx_len[next] > 0)
     {
+        /* Pending data in the other buffer — start transmitting it now      */
         tx_read_idx          = next;
         tx_write_idx         = tx_read_idx ^ 1U;
         tx_len[tx_write_idx] = 0;
-        HAL_UART_Transmit_IT(&hlpuart1,
-                             tx_buf[tx_read_idx],
-                             tx_len[tx_read_idx]);
+        HAL_UART_Transmit_IT(&hlpuart1, tx_buf[tx_read_idx], tx_len[tx_read_idx]);
     }
     else
     {
-        tx_busy = 0;
+        tx_busy = 0;   /* No pending data; UART is now idle                  */
     }
 }
 
-/* ════════════════════════════════════════════════════════════════════════
- *  ADC DMA CALLBACK
- * ════════════════════════════════════════════════════════════════════════ */
-
+/* ── HAL_ADC_ConvCpltCallback ────────────────────────────────────────────── */
 /**
- * @brief  DMA transfer-complete callback.
- *         Sets capture_done so the main loop calls Process_Buffer().
+ * @brief  DMA transfer-complete callback for the dual ADC.
+ *
+ *         Called when DMA1 has filled all SAMPLE_COUNT words of adc_dual_buf.
+ *         Sets the capture_done flag so the main loop can call Process_Buffer().
+ *
+ *         Heavy processing is intentionally deferred to the main loop to
+ *         avoid blocking the ISR and starving other interrupts.
+ *
+ * @param  hadc  Pointer to the ADC handle (checked to be ADC1/master).
  */
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
     if (hadc->Instance == ADC1)
     {
+        /* Simply raise flag. Array processing is offloaded to main loop to stop ISR choke */
         capture_done = 1;
     }
 }
 
-
- /* ================================================================
-         * OLED DISPLAY UPDATE
-         * ============================================================== */
-        /* Only update the display if the SSD1306 I2C DMA is idle.
-         * SSD1306_IsReady() returns false while a previous frame transfer
-         * is still in progress, preventing I2C bus contention.             */
-        if (SSD1306_IsReady())
-        {
-            char oled_v[32];
-            char oled_i[32];
-            char oled_p[32];
-            char oled_pf[32];
-
-            snprintf(oled_v,  sizeof(oled_v),  "Vrms : %.1f V", (double)vrms);
-            snprintf(oled_i,  sizeof(oled_i),  "Irms : %.2f A", (double)irms);
-            snprintf(oled_p,  sizeof(oled_p),  "Power: %.1f W", (double)active_power);
-            snprintf(oled_pf, sizeof(oled_pf), "PF   : %.2f",   (double)power_factor);
-
-            SSD1306_Clear();
-
-            /* Page 0: Title */
-            SSD1306_WriteString(0, 0, "-- Power Monitor --");
-
-            /* Pages 2 & 3: Voltage and Current */
-            SSD1306_WriteString(0, 2, oled_v);
-            SSD1306_WriteString(0, 3, oled_i);
-
-            /* Pages 5 & 6: Power and Power Factor */
-            SSD1306_WriteString(0, 5, oled_p);
-            SSD1306_WriteString(0, 6, oled_pf);
-
-            SSD1306_UpdateScreen();
-        }
-    }
-
-    /* Single flush — kicks off IT transfer for the whole assembled frame    */
-    UART_Print_IT("----------------------------------------\r\n");
-    UART_Flush_IT();
-
-    /* ── FIX: Clear Hardware Overrun flags before re-arming ── */
-    /* ADC overrun (OVR) occurs when a new conversion completes before the
-     * previous result was read. Clearing OVR here prevents the next DMA
-     * capture from being suppressed by a stale overrun condition.           */
-    __HAL_ADC_CLEAR_FLAG(&hadc1, ADC_FLAG_OVR);
-    __HAL_ADC_CLEAR_FLAG(&hadc2, ADC_FLAG_OVR);
-
-    /* ── Re-arm DMA ── */
-    /* Restart dual simultaneous ADC DMA capture for the next frame.
-     * TIM1 TRGO continues running so conversion timing is uninterrupted.   */
-    HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)adc_dual_buf, SAMPLE_COUNT);
-}
 /* ── Find_Peak_Bin ───────────────────────────────────────────────────────── */
 /**
  * @brief  Locate the CZT magnitude peak near an expected harmonic bin.
@@ -615,6 +617,53 @@ static void Compute_CZT_Harmonics_I(float freq)
     snprintf(thd_line, sizeof(thd_line), "THD: %6.2f%%\r\n\r\n", (double)thd);
     UART_Print_IT(thd_line);
 }
+
+/* ── Process_Buffer ──────────────────────────────────────────────────────── */
+/**
+ * @brief  Main per-frame processing routine — called from the main loop
+ *         every time capture_done is raised by the DMA callback.
+ *
+ *         Processing sequence:
+ *
+ *         1. SNAPSHOT & SPLIT
+ *            Unpack the 32-bit dual-ADC DMA words into separate float arrays
+ *            local_v[] (ADC1, voltage) and local_i[] (ADC2, current).
+ *
+ *         2. VOLTAGE CHANNEL
+ *            a. DC bias  — estimated as average of the N lowest and N highest
+ *                          samples (PEAK_AVG_COUNT = 10); robust against a few
+ *                          outliers.
+ *            b. VRMS     — sqrt( Σ(v−bias)² / N ) × (Vref/ADC_RES) × CAL_FACTOR_V
+ *            c. Frequency — zero-crossing rate with hysteresis (ZC_HYST_V);
+ *                           falls back to FUNDAMENTAL_HZ if no crossings.
+ *            d. CZT      — Hann-windowed spectrum; harmonic report + THD.
+ *
+ *         3. CURRENT CHANNEL
+ *            Same structure as voltage but uses COUNTS_TO_AMPS() for
+ *            unit conversion and the rectangular window for CZT.
+ *            Also prints diagnostic voltages (V_adc, V_sens, V0G_cal) to
+ *            assist calibration verification.
+ *
+ *         4. POWER & POWER FACTOR
+ *            Active power P = (1/N) Σ v_inst·i_inst  (instantaneous product)
+ *            Apparent power S = Vrms × Irms
+ *            Power factor PF = P / S    (clamped to [-1, 1])
+ *            Phase angle φ = arccos(PF) in degrees
+ *
+ *         5. OLED UPDATE
+ *            Displays Vrms, Irms, Active Power and PF on the SSD1306 screen
+ *            (only if SSD1306_IsReady() is true — skipped during I2C DMA).
+ *
+ *         6. UART FLUSH
+ *            Calls UART_Flush_IT() once to transmit the assembled frame.
+ *
+ *         7. RE-ARM DMA
+ *            Clears any ADC overrun flags and restarts the dual DMA capture
+ *            so the next frame begins accumulating immediately.
+ *
+ * @note   local_v and local_i are declared static to avoid allocating
+ *         2 × SAMPLE_COUNT × 4 bytes (8 kB) on the call stack each frame.
+ */
 static void Process_Buffer(void)
 {
     static float local_v[SAMPLE_COUNT];   /* voltage samples (float)          */
@@ -917,6 +966,7 @@ static void Process_Buffer(void)
      * TIM1 TRGO continues running so conversion timing is uninterrupted.   */
     HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)adc_dual_buf, SAMPLE_COUNT);
 }
+
 /* USER CODE END 0 */
 
 /**
@@ -964,29 +1014,32 @@ int main(void)
     SSD1306_UpdateScreen();
     HAL_Delay(500);   /* Allow OLED DMA transfer to complete before continuing */
 
+    /* ── Pre-compute CZT tables once ── */
+    CZT_Init();
 
-/* ── CZT precompute  ── */
-CZT_Init();
+    /* ── ADC self-calibration ── */
+    /* HAL calibration removes internal offset errors from the ADC hardware.
+     * Must be run before the first conversion and after each power-on.     */
+    HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
+    HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED);
 
-/* ── ADC self-calibration  ── */
-HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
-HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED);
+    /* ── Startup UART banner ── */
+    UART_Print_IT("\r\n=== CZT Simultaneous V+I Harmonic Analyser (G474RE) ===\r\n");
+    UART_Print_IT("[V] ZMPT101B 5V + 10k/10k divider -> PA0  (ADC1_IN1)\r\n");
+    UART_Print_IT("[I] WCS1700  5V + 10k/10k divider -> PA6  (ADC2_IN3)\r\n");
+    UART_Print_IT("fs=10kHz  N=1000  Df=500Hz  fR=0.5Hz\r\n");
+    UART_Print_IT("Dual Regular Simultaneous mode, TIM1 TRGO trigger\r\n");
+    UART_Print_IT("H1(50Hz)..H10(500Hz) + THD  per channel\r\n");
+    UART_Print_IT("-------------------------------------------------------\r\n");
+    UART_Flush_IT();
 
-/* ── Startup UART banner ── */
-UART_Print_IT("\r\n=== CZT Simultaneous V+I Harmonic Analyser (G474RE) ===\r\n");
-UART_Print_IT("[V] ZMPT101B 5V + 10k/10k divider -> PA0  (ADC1_IN1)\r\n");
-UART_Print_IT("[I] WCS1700  5V + 10k/10k divider -> PA6  (ADC2_IN3)\r\n");
-UART_Print_IT("fs=10kHz  N=1000  Df=500Hz  fR=0.5Hz\r\n");
-UART_Print_IT("Dual Regular Simultaneous mode, TIM1 TRGO trigger\r\n");
-UART_Print_IT("H1(50Hz)..H10(500Hz) + THD  per channel\r\n");
-UART_Print_IT("-------------------------------------------------------\r\n");
-UART_Flush_IT();
-
-/* ── Start dual ADC DMA capture  ── */
-HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)adc_dual_buf, SAMPLE_COUNT);
-HAL_TIM_Base_Start(&htim1);
-
-/* USER CODE END 2 */
+    /* ── Start dual ADC DMA capture ── */
+    /* HAL_ADCEx_MultiModeStart_DMA arms the DMA and enables both ADCs.
+     * TIM1 TRGO events pace conversions at SAMPLE_RATE (10 kHz).          */
+    /* Start dual ADC — DMA reads ADC12_CDR (32-bit interleaved words)      */
+    HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)adc_dual_buf, SAMPLE_COUNT);
+    HAL_TIM_Base_Start(&htim1);
+  /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
