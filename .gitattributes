@@ -95,8 +95,8 @@ CMakeLists.txt text eol=lf
 # ###############################################################################
 # # MATLAB / data files (common in research repos)
 # ###############################################################################
-# *.mat      binary
-# *.npy      binary
-# *.npz      binary
-# *.h5       binary
-# *.hdf5     binary
+*.mat      binary
+*.npy      binary
+*.npz      binary
+*.h5       binary
+*.hdf5     binary
