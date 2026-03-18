@@ -72,44 +72,78 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 /* ── Acquisition parameters ────────────────────────────────────────────── */
-#define SAMPLE_COUNT    1000U
-#define KERN_LEN        (2U * SAMPLE_COUNT - 1U)
-#define VREF            3.3f
-#define ADC_RES         4096.0f
-#define SAMPLE_RATE     10000.0f
-#define NUM_HARMONICS   10
+#define SAMPLE_COUNT    1000U               /* Samples per captured frame     */
+#define KERN_LEN        (2U * SAMPLE_COUNT - 1U)   /* CZT kernel length = 1999 */
+#define VREF            3.3f               /* STM32 ADC reference voltage (V) */
+#define ADC_RES         4096.0f            /* 12-bit ADC full-scale counts    */
+#define SAMPLE_RATE     10000.0f           /* ADC sample rate (Hz)            */
+#define NUM_HARMONICS   10                 /* Number of harmonics to resolve  */
 
 /* ── Voltage channel calibration ───────────────────────────────────────── */
+/* CAL_FACTOR_V converts ADC RMS counts → true AC RMS volts.
+ * It combines the ZMPT101B transformer turns ratio and the 10k/10k
+ * resistive voltage divider at the ADC input.                               */
 #define CAL_FACTOR_V    623.81f
 
 /* ── Current channel calibration ───────────────────────────────────────── */
-#define DIVIDER_RATIO           0.5f
-#define SENS_MV_PER_A_SENSOR    33.0f
-#define V0G_SENSOR_V            2.500f
-#define SENS_MV_PER_A_ADC       (SENS_MV_PER_A_SENSOR * DIVIDER_RATIO)
+/* The WCS1700 Hall-effect sensor outputs ±33 mV/A centred on Vcc/2 (2.5 V).
+ * A 10k/10k resistive divider halves the sensor swing before the ADC.      */
+#define DIVIDER_RATIO           0.5f               /* Resistive divider ratio  */
+#define SENS_MV_PER_A_SENSOR    33.0f              /* Sensor sensitivity mV/A  */
+#define V0G_SENSOR_V            2.500f             /* Sensor zero-current voltage (V) */
+#define SENS_MV_PER_A_ADC       (SENS_MV_PER_A_SENSOR * DIVIDER_RATIO)  /* 16.5 mV/A after divider */
+
+/* Zero-current ADC count (mid-scale after divider ≈ 1437).
+ * Update this after Step-1 zero calibration (no load connected).           */
 #define V0G_COUNTS_CAL          1437.0f
+
+/* Gain trim factor measured during Step-2 load calibration.
+ * Update after comparing IRMS reading against a trusted reference.         */
 #define CAL_GAIN                0.923410f
+
+/**
+ * @brief  Convert a zero-referenced ADC count difference to amperes.
+ * @param  c   ADC count offset from zero-current point (signed float)
+ * @return Current in amperes (float)
+ *
+ * Formula:
+ *   I = (c × Vref/ADC_RES) / (SENS_mV/A_adc × 1e-3)  × CAL_GAIN
+ */
 #define COUNTS_TO_AMPS(c) \
     ((c) * (VREF / ADC_RES) / (SENS_MV_PER_A_ADC * 1e-3f) * CAL_GAIN)
 
-/* ── CZT parameters ─────────────────────────────────────────────────────── */
-#define CZT_DELTA_F     500.0f
-#define CZT_FREQ_RES    (CZT_DELTA_F / (float)SAMPLE_COUNT)
+/* ── CZT (Chirp Z-Transform) parameters ────────────────────────────────── */
+/* The CZT maps SAMPLE_COUNT time-domain samples to SAMPLE_COUNT frequency
+ * bins spanning [0, CZT_DELTA_F] Hz with resolution CZT_FREQ_RES.
+ * At 10 kHz / 1000 points the Nyquist is 5 kHz, but we only need 0–500 Hz
+ * to cover H1(50 Hz) through H10(500 Hz).                                  */
+#define CZT_DELTA_F     500.0f                     /* CZT span: 0–500 Hz      */
+#define CZT_FREQ_RES    (CZT_DELTA_F / (float)SAMPLE_COUNT)   /* 0.5 Hz/bin  */
+/* Angular step between adjacent CZT output bins (radians):
+ *   C = π × Δf / (N × fs)   ≈ 1.571e-4 rad                                 */
 #define CZT_C           ((float)M_PI * CZT_DELTA_F \
                          / ((float)SAMPLE_COUNT * SAMPLE_RATE))
 
 /* ── Harmonic search ────────────────────────────────────────────────────── */
-#define FUNDAMENTAL_HZ  50U
-#define SEARCH_BINS     4U
+#define FUNDAMENTAL_HZ  50U    /* Expected mains fundamental frequency (Hz)  */
+#define SEARCH_BINS     4U     /* ±4 bins around ideal harmonic bin to track
+                                *  small frequency deviations                */
 
 /* ── Zero-crossing hysteresis ───────────────────────────────────────────── */
-#define ZC_HYST_V       25.0f
-#define ZC_HYST_I       12.0f
+/* Prevents noise-induced false crossings near the DC bias level.
+ * The signal must cross bias ± HYST before a transition is counted.        */
+#define ZC_HYST_V       25.0f  /* Voltage channel (ZMPT101B) — ADC counts    */
+#define ZC_HYST_I       12.0f  /* Current channel (WCS1700)  — ADC counts    */
 
 /* ── DC bias estimation ─────────────────────────────────────────────────── */
+/* The bias is estimated as (avg_of_N_lowest + avg_of_N_highest) / 2.
+ * PEAK_AVG_COUNT controls how many extremes are averaged to reduce the
+ * impact of individual noise spikes on the bias estimate.                   */
 #define PEAK_AVG_COUNT  10
 
 /* ── TX ping-pong UART buffer ───────────────────────────────────────────── */
+/* Two buffers allow one frame to be assembled while the previous is being
+ * transmitted via interrupt-driven UART, eliminating blocking delays.      */
 #define TX_BUF_SIZE     2048U
 /* USER CODE END PD */
 
