@@ -188,6 +188,20 @@ static void Process_Buffer(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+/* ── OLED I2C Callback ───────────────────────────────────────────────────── */
+/**
+ * @brief  HAL I2C master TX-complete callback.
+ *         Forwards the event to the SSD1306 driver so it can pipeline
+ *         the next DMA chunk (multi-page transfers are split internally).
+ * @param  hi2c  Pointer to the I2C handle that fired the callback.
+ */
+void HAL_I2C_MasterTxCpltCallback(I2C_HandleTypeDef *hi2c)
+{
+    SSD1306_TxCpltCallback(hi2c);
+}
+
+
+
 /* ════════════════════════════════════════════════════════════════════════
  * UART PING-PONG TX SYSTEM
  * ════════════════════════════════════════════════════════════════════════ */
@@ -264,6 +278,59 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
     }
 }
 
+
+ /* ================================================================
+         * OLED DISPLAY UPDATE
+         * ============================================================== */
+        /* Only update the display if the SSD1306 I2C DMA is idle.
+         * SSD1306_IsReady() returns false while a previous frame transfer
+         * is still in progress, preventing I2C bus contention.             */
+        if (SSD1306_IsReady())
+        {
+            char oled_v[32];
+            char oled_i[32];
+            char oled_p[32];
+            char oled_pf[32];
+
+            snprintf(oled_v,  sizeof(oled_v),  "Vrms : %.1f V", (double)vrms);
+            snprintf(oled_i,  sizeof(oled_i),  "Irms : %.2f A", (double)irms);
+            snprintf(oled_p,  sizeof(oled_p),  "Power: %.1f W", (double)active_power);
+            snprintf(oled_pf, sizeof(oled_pf), "PF   : %.2f",   (double)power_factor);
+
+            SSD1306_Clear();
+
+            /* Page 0: Title */
+            SSD1306_WriteString(0, 0, "-- Power Monitor --");
+
+            /* Pages 2 & 3: Voltage and Current */
+            SSD1306_WriteString(0, 2, oled_v);
+            SSD1306_WriteString(0, 3, oled_i);
+
+            /* Pages 5 & 6: Power and Power Factor */
+            SSD1306_WriteString(0, 5, oled_p);
+            SSD1306_WriteString(0, 6, oled_pf);
+
+            SSD1306_UpdateScreen();
+        }
+    }
+
+    /* Single flush — kicks off IT transfer for the whole assembled frame    */
+    UART_Print_IT("----------------------------------------\r\n");
+    UART_Flush_IT();
+
+    /* ── FIX: Clear Hardware Overrun flags before re-arming ── */
+    /* ADC overrun (OVR) occurs when a new conversion completes before the
+     * previous result was read. Clearing OVR here prevents the next DMA
+     * capture from being suppressed by a stale overrun condition.           */
+    __HAL_ADC_CLEAR_FLAG(&hadc1, ADC_FLAG_OVR);
+    __HAL_ADC_CLEAR_FLAG(&hadc2, ADC_FLAG_OVR);
+
+    /* ── Re-arm DMA ── */
+    /* Restart dual simultaneous ADC DMA capture for the next frame.
+     * TIM1 TRGO continues running so conversion timing is uninterrupted.   */
+    HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)adc_dual_buf, SAMPLE_COUNT);
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -304,12 +371,13 @@ int main(void)
   MX_RTC_Init();
   /* USER CODE BEGIN 2 */
 
-/* ── OLED splash  ── */
-SSD1306_Init(&hi2c1);
-SSD1306_Clear();
-SSD1306_WriteString(0, 0, "Booting...");
-SSD1306_UpdateScreen();
-HAL_Delay(500);
+    /* ── OLED splash screen ── */
+    SSD1306_Init(&hi2c1);
+    SSD1306_Clear();
+    SSD1306_WriteString(0, 0, "Booting...");
+    SSD1306_UpdateScreen();
+    HAL_Delay(500);   /* Allow OLED DMA transfer to complete before continuing */
+
 
 /* ── CZT precompute  ── */
 CZT_Init();
@@ -341,11 +409,14 @@ HAL_TIM_Base_Start(&htim1);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-   if (capture_done) 
-   {
-    capture_done = 0;
-    HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
-    Process_Buffer(); 
+    /* Poll the flag set by HAL_ADC_ConvCpltCallback.
+     * When set, the DMA has filled adc_dual_buf with SAMPLE_COUNT samples.
+     * Clear immediately so a new capture can begin inside Process_Buffer().  */
+    if (capture_done)
+    {
+        capture_done = 0;
+        HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin); /* Heartbeat LED toggle */
+        Process_Buffer();
     }
   }
   /* USER CODE END 3 */
