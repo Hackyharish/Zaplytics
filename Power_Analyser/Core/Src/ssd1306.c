@@ -1,21 +1,41 @@
+/**
+ * @file ssd1306.c
+ * @brief SSD1306 OLED Display Driver for the CZT Harmonic Analyser.
+ * * This driver controls a 128x64 pixel OLED display via an I2C interface 
+ * operating at 400 kHz[cite: 475, 534]. It uses a DMA-driven framebuffer 
+ * architecture (DMA1 Channel 2) to ensure the DSP pipeline and CPU are 
+ * never stalled during screen refreshes[cite: 477, 536].
+ */
+
 #include "ssd1306.h"
 
 /* ── SSD1306 command bytes ─────────────────────────────────────────── */
+/* * The SSD1306 requires a control byte before the payload to indicate 
+ * whether the following bytes are commands or display data.
+ */
 #define SSD1306_CMD_BYTE        0x00   /* Co=0, D/C#=0 → command stream */
 #define SSD1306_DATA_BYTE       0x40   /* Co=0, D/C#=1 → data stream    */
 
 /* ── Internal state ────────────────────────────────────────────────── */
+/* * Hardware abstraction layer I2C handle pointer and a volatile busy flag 
+ * to prevent overlapping DMA transfers from corrupting the display[cite: 591].
+ */
 static I2C_HandleTypeDef *_hi2c;
 static volatile uint8_t   _txBusy = 0;
 
 /*
- * Frame buffer: 1 control byte + 1024 pixel bytes
+ * Frame buffer: 1 control byte + 1024 pixel bytes[cite: 584].
  * Laid out as 8 pages × 128 columns (each byte = 8 vertical pixels).
- * buf[0] is the I2C data-stream control byte (0x40), sent once per DMA transfer.
+ * buf[0] is the I2C data-stream control byte (0x40), sent once per DMA transfer[cite: 584].
+ * This static buffer allows offloading the 1025-byte transfer entirely to DMA[cite: 260].
  */
 static uint8_t _buf[1 + SSD1306_WIDTH * (SSD1306_HEIGHT / 8)];
 
 /* Tiny 5×7 ASCII font (printable chars 0x20–0x7E) */
+/* * This compact lookup table maps standard ASCII characters to their visual 
+ * representation, conserving memory while providing legible text for 
+ * telemetry outputs like Vrms, Irms, and Active Power[cite: 176].
+ */
 static const uint8_t font5x7[][5] = {
     {0x00,0x00,0x00,0x00,0x00}, /* ' ' */
     {0x00,0x00,0x5F,0x00,0x00}, /* '!' */
@@ -116,38 +136,47 @@ static const uint8_t font5x7[][5] = {
 
 /* ── Helpers ───────────────────────────────────────────────────────── */
 
-/* Send a command byte (interrupt mode, short transfer) */
+/* * Send a command byte (interrupt mode, short transfer) 
+ * Used for sending isolated commands to the OLED controller safely.
+ */
 static HAL_StatusTypeDef _sendCmd(uint8_t cmd)
 {
     uint8_t buf[2] = { SSD1306_CMD_BYTE, cmd };
-    /* Wait for any ongoing transfer */
+    /* Wait for any ongoing transfer to avoid bus collisions */
     uint32_t t = HAL_GetTick();
     while (_txBusy && (HAL_GetTick() - t < 10));
     _txBusy = 1;
     return HAL_I2C_Master_Transmit_IT(_hi2c, SSD1306_I2C_ADDR, buf, 2);
 }
 
-/* Send multiple commands (blocking shortcut used only during init) */
+/* * Send multiple commands (blocking shortcut used only during init) 
+ * Iterates through a given array of commands and dispatches them sequentially.
+ */
 static void _sendCmdList(const uint8_t *cmds, uint8_t len)
 {
     for (uint8_t i = 0; i < len; i++) _sendCmd(cmds[i]);
-    /* Allow last IT transfer to finish */
+    /* Allow last IT transfer to finish before returning */
     uint32_t t = HAL_GetTick();
     while (_txBusy && (HAL_GetTick() - t < 20));
 }
 
 /* ── Public functions ──────────────────────────────────────────────── */
 
+/*
+ * @brief Initializes the OLED display with the required charge pump and multiplexer settings.
+ * @param hi2c Pointer to the pre-configured I2C peripheral handle.
+ */
 void SSD1306_Init(I2C_HandleTypeDef *hi2c)
 {
     _hi2c = hi2c;
     _txBusy = 0;
 
-    /* Control byte prefix for the DMA frame buffer */
+    /* Control byte prefix for the DMA frame buffer; establishes this stream as image data[cite: 584]. */
     _buf[0] = SSD1306_DATA_BYTE;
 
-    HAL_Delay(100); /* wait for display power-on */
+    HAL_Delay(100); /* wait for display power-on to stabilize */
 
+    /* Standard initialization sequence for a 128x64 SSD1306 controller */
     static const uint8_t initSeq[] = {
         0xAE,       /* display off */
         0xD5, 0x80, /* clock divide / osc freq */
@@ -172,19 +201,32 @@ void SSD1306_Init(I2C_HandleTypeDef *hi2c)
     SSD1306_UpdateScreen();
 }
 
+/*
+ * @brief Wipes the internal SRAM framebuffer memory clean. 
+ * Note: Does not push the clear to the screen immediately; requires SSD1306_UpdateScreen().
+ */
 void SSD1306_Clear(void)
 {
     memset(&_buf[1], 0x00, SSD1306_WIDTH * (SSD1306_HEIGHT / 8));
 }
 
+/*
+ * @brief Fills the entire framebuffer with a specific bit pattern.
+ */
 void SSD1306_Fill(uint8_t pattern)
 {
     memset(&_buf[1], pattern, SSD1306_WIDTH * (SSD1306_HEIGHT / 8));
 }
 
+/*
+ * @brief Safely alters a single bit in the 1024-byte framebuffer corresponding to (x,y)[cite: 585].
+ * @param color Non-zero turns the pixel ON, zero turns it OFF.
+ */
 void SSD1306_DrawPixel(uint8_t x, uint8_t y, uint8_t color)
 {
     if (x >= SSD1306_WIDTH || y >= SSD1306_HEIGHT) return;
+    
+    /* Calculate the 1D buffer index based on 8-pixel vertical pages[cite: 586]. */
     uint16_t idx = 1 + x + (y / 8) * SSD1306_WIDTH;
     if (color)
         _buf[idx] |=  (1 << (y % 8));
@@ -192,26 +234,38 @@ void SSD1306_DrawPixel(uint8_t x, uint8_t y, uint8_t color)
         _buf[idx] &= ~(1 << (y % 8));
 }
 
+/*
+ * @brief Renders a null-terminated string onto a specific page (row) and column.
+ * @param page The vertical row (0 to 7) corresponding to the display layout[cite: 597].
+ */
 void SSD1306_WriteString(uint8_t x, uint8_t page, const char *str)
 {
     /* page: 0-7, x: pixel column */
     while (*str && x + 5 <= SSD1306_WIDTH) {
         uint8_t c = (uint8_t)*str++;
+        
+        /* Map unsupported characters to '?' */
         if (c < 0x20 || c > 0x7E) c = '?';
         const uint8_t *glyph = font5x7[c - 0x20];
+        
+        /* Draw the 5 columns of the current character */
         for (uint8_t col = 0; col < 5; col++) {
             _buf[1 + x + page * SSD1306_WIDTH] = glyph[col];
             x++;
         }
-        /* 1-pixel gap between characters */
+        /* 1-pixel gap between characters for readability */
         _buf[1 + x + page * SSD1306_WIDTH] = 0x00;
         x++;
     }
 }
 
+/*
+ * @brief Fires the DMA transfer to push the 1025-byte framebuffer to the OLED.
+ * This function triggers the transfer and returns immediately, freeing the CPU[cite: 477, 590].
+ */
 void SSD1306_UpdateScreen(void)
 {
-    /* Set column and page address back to (0,0) before each DMA burst */
+    /* Set column and page address back to (0,0) before each DMA burst[cite: 590]. */
     static const uint8_t addrReset[] = {
         0x21, 0x00, 0x7F,   /* column address: 0–127 */
         0x22, 0x00, 0x07,   /* page address:   0–7   */
@@ -222,17 +276,27 @@ void SSD1306_UpdateScreen(void)
     uint32_t t = HAL_GetTick();
     while (_txBusy && (HAL_GetTick() - t < 20));
     _txBusy = 1;
+    
+    /* Initiates non-blocking I2C transfer via DMA1 Channel 2[cite: 260]. */
     HAL_I2C_Master_Transmit_DMA(_hi2c,
                                  SSD1306_I2C_ADDR,
                                  _buf,
                                  sizeof(_buf));
 }
 
+/*
+ * @brief Checks if the display is ready to accept a new framebuffer transfer.
+ * @return 1 if idle, 0 if a DMA or IT transfer is currently active[cite: 729].
+ */
 uint8_t SSD1306_IsReady(void)
 {
     return !_txBusy;
 }
 
+/*
+ * @brief I2C transmit complete callback triggered by the DMA interrupt.
+ * This clears the busy flag once the 1025 bytes have successfully clocked out[cite: 591].
+ */
 void SSD1306_TxCpltCallback(I2C_HandleTypeDef *hi2c)
 {
     if (hi2c->Instance == _hi2c->Instance)
