@@ -20,7 +20,7 @@ Parses the exact UART frame your firmware emits:
   [I] Bias:XXXX | V_adc=X.XXXv V_sens=X.XXXv V0G_cal=X.XXXv | PkPk:XXXX | Freq:XX.XXHz | IRMS:X.XXXXA
   [I] CZT Harmonics (fund=XX.XXHz  fR=X.XXXXHz)
   H01 (  50Hz):  X.XXXXa rms  [bin XXX]
-  ...
+  ...   
   THD:  XX.XX%
 
   [PWR] Active:  XXX.XX W | Apparent:  XXX.XX VA | PF: X.XXX | Phase:  XX.X deg
