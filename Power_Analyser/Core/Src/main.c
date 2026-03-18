@@ -58,7 +58,10 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <math.h>
+#include <string.h>
+#include <stdio.h>
+#include "ssd1306.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -68,7 +71,46 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+/* ── Acquisition parameters ────────────────────────────────────────────── */
+#define SAMPLE_COUNT    1000U
+#define KERN_LEN        (2U * SAMPLE_COUNT - 1U)
+#define VREF            3.3f
+#define ADC_RES         4096.0f
+#define SAMPLE_RATE     10000.0f
+#define NUM_HARMONICS   10
 
+/* ── Voltage channel calibration ───────────────────────────────────────── */
+#define CAL_FACTOR_V    623.81f
+
+/* ── Current channel calibration ───────────────────────────────────────── */
+#define DIVIDER_RATIO           0.5f
+#define SENS_MV_PER_A_SENSOR    33.0f
+#define V0G_SENSOR_V            2.500f
+#define SENS_MV_PER_A_ADC       (SENS_MV_PER_A_SENSOR * DIVIDER_RATIO)
+#define V0G_COUNTS_CAL          1437.0f
+#define CAL_GAIN                0.923410f
+#define COUNTS_TO_AMPS(c) \
+    ((c) * (VREF / ADC_RES) / (SENS_MV_PER_A_ADC * 1e-3f) * CAL_GAIN)
+
+/* ── CZT parameters ─────────────────────────────────────────────────────── */
+#define CZT_DELTA_F     500.0f
+#define CZT_FREQ_RES    (CZT_DELTA_F / (float)SAMPLE_COUNT)
+#define CZT_C           ((float)M_PI * CZT_DELTA_F \
+                         / ((float)SAMPLE_COUNT * SAMPLE_RATE))
+
+/* ── Harmonic search ────────────────────────────────────────────────────── */
+#define FUNDAMENTAL_HZ  50U
+#define SEARCH_BINS     4U
+
+/* ── Zero-crossing hysteresis ───────────────────────────────────────────── */
+#define ZC_HYST_V       25.0f
+#define ZC_HYST_I       12.0f
+
+/* ── DC bias estimation ─────────────────────────────────────────────────── */
+#define PEAK_AVG_COUNT  10
+
+/* ── TX ping-pong UART buffer ───────────────────────────────────────────── */
+#define TX_BUF_SIZE     2048U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -91,7 +133,27 @@ RTC_HandleTypeDef hrtc;
 TIM_HandleTypeDef htim1;
 
 /* USER CODE BEGIN PV */
+/* ── ADC DMA buffer ─────────────────────────────────────────────────────── */
+static uint32_t  adc_dual_buf[SAMPLE_COUNT];
+volatile uint8_t capture_done = 0;
 
+/* ── CZT arrays  ──────────────────────── */
+static float tw_n_re[SAMPLE_COUNT];
+static float tw_n_im[SAMPLE_COUNT];
+static float kern_re[KERN_LEN];
+static float kern_im[KERN_LEN];
+static float hann_win_v[SAMPLE_COUNT];
+static float rect_win_i[SAMPLE_COUNT];
+static float g_re[SAMPLE_COUNT];
+static float g_im[SAMPLE_COUNT];
+static float czt_mag[SAMPLE_COUNT];
+
+/* ── UART ping-pong TX buffers ──────────────────────────────────────────── */
+static uint8_t          tx_buf[2][TX_BUF_SIZE];
+static uint16_t         tx_len[2]      = {0, 0};
+static uint8_t          tx_write_idx   = 0;
+static uint8_t          tx_read_idx    = 0;
+static volatile uint8_t tx_busy        = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -105,11 +167,102 @@ static void MX_ADC2_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_RTC_Init(void);
 /* USER CODE BEGIN PFP */
+/* ── UART  ── */
+static void UART_Print_IT(const char *msg);
+static void UART_Flush_IT(void);
+void        HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart);
 
+/* ── ADC  ── */
+void        HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc);
+
+/* ── Needed by shared Process_Buffer ── */
+void        HAL_I2C_MasterTxCpltCallback(I2C_HandleTypeDef *hi2c);
+static int  Find_Peak_Bin(int expected_bin);
+static void CZT_Init(void);
+static void CZT_Compute_From_Buffer(const float *buf, float bias, const float *win);
+static void Compute_CZT_Harmonics_V(float freq);
+static void Compute_CZT_Harmonics_I(float freq);
+static void Process_Buffer(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/* ════════════════════════════════════════════════════════════════════════
+ * UART PING-PONG TX SYSTEM
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief  Append a string to the active write buffer (non-blocking).
+ */
+static void UART_Print_IT(const char *msg)
+{
+    uint16_t len  = (uint16_t)strlen(msg);
+    uint16_t used = tx_len[tx_write_idx];
+    if (used + len > TX_BUF_SIZE) return;
+    memcpy(&tx_buf[tx_write_idx][used], msg, len);
+    tx_len[tx_write_idx] = used + len;
+}
+
+/**
+ * @brief  Swap ping-pong buffers and start interrupt-driven UART TX.
+ */
+static void UART_Flush_IT(void)
+{
+    if (tx_len[tx_write_idx] == 0) return;
+
+    if (!tx_busy)
+    {
+        tx_read_idx          = tx_write_idx;
+        tx_write_idx         = tx_write_idx ^ 1U;
+        tx_len[tx_write_idx] = 0;
+        tx_busy = 1;
+        HAL_UART_Transmit_IT(&hlpuart1,
+                             tx_buf[tx_read_idx],
+                             tx_len[tx_read_idx]);
+    }
+}
+
+/**
+ * @brief  UART TX-complete callback — auto-chains next buffer if pending.
+ */
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance != LPUART1) return;
+
+    tx_len[tx_read_idx] = 0;
+
+    uint8_t next = tx_read_idx ^ 1U;
+    if (tx_len[next] > 0)
+    {
+        tx_read_idx          = next;
+        tx_write_idx         = tx_read_idx ^ 1U;
+        tx_len[tx_write_idx] = 0;
+        HAL_UART_Transmit_IT(&hlpuart1,
+                             tx_buf[tx_read_idx],
+                             tx_len[tx_read_idx]);
+    }
+    else
+    {
+        tx_busy = 0;
+    }
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ *  ADC DMA CALLBACK
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief  DMA transfer-complete callback.
+ *         Sets capture_done so the main loop calls Process_Buffer().
+ */
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
+{
+    if (hadc->Instance == ADC1)
+    {
+        capture_done = 1;
+    }
+}
 
 /* USER CODE END 0 */
 
@@ -151,7 +304,35 @@ int main(void)
   MX_RTC_Init();
   /* USER CODE BEGIN 2 */
 
-  /* USER CODE END 2 */
+/* ── OLED splash  ── */
+SSD1306_Init(&hi2c1);
+SSD1306_Clear();
+SSD1306_WriteString(0, 0, "Booting...");
+SSD1306_UpdateScreen();
+HAL_Delay(500);
+
+/* ── CZT precompute  ── */
+CZT_Init();
+
+/* ── ADC self-calibration  ── */
+HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
+HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED);
+
+/* ── Startup UART banner ── */
+UART_Print_IT("\r\n=== CZT Simultaneous V+I Harmonic Analyser (G474RE) ===\r\n");
+UART_Print_IT("[V] ZMPT101B 5V + 10k/10k divider -> PA0  (ADC1_IN1)\r\n");
+UART_Print_IT("[I] WCS1700  5V + 10k/10k divider -> PA6  (ADC2_IN3)\r\n");
+UART_Print_IT("fs=10kHz  N=1000  Df=500Hz  fR=0.5Hz\r\n");
+UART_Print_IT("Dual Regular Simultaneous mode, TIM1 TRGO trigger\r\n");
+UART_Print_IT("H1(50Hz)..H10(500Hz) + THD  per channel\r\n");
+UART_Print_IT("-------------------------------------------------------\r\n");
+UART_Flush_IT();
+
+/* ── Start dual ADC DMA capture  ── */
+HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)adc_dual_buf, SAMPLE_COUNT);
+HAL_TIM_Base_Start(&htim1);
+
+/* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
@@ -160,6 +341,12 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+   if (capture_done) 
+   {
+    capture_done = 0;
+    HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+    Process_Buffer(); 
+    }
   }
   /* USER CODE END 3 */
 }
