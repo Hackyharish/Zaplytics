@@ -17,12 +17,12 @@
 
 ### Team Members
 
-| Name | Register No. | Contribution |
+| Name |
 |---|---|---|
-| Gopika Gokul | CB.EN.U4EEE23009 | UART ping-pong TX, dual ADC sampling, power metrics (P, S, PF, φ), voltage channel |
-| Anmol Govindarajapuram Krishnan | CB.EN.U4EEE23103 | CZT spectral engine, harmonic extraction, voltage CZT channel |
-| Harish R | CB.EN.U4EEE23112 | UART telemetry output, current channel, Python dashboard |
-| Mauli Rajguru | CB.EN.U4EEE23120 | OLED driver (SSD1306), display layout, main function integration |
+| Gopika Gokul |
+| Anmol Govindarajapuram Krishnan | 
+| Harish R | 
+| Mauli Rajguru | 
 
 ---
 
@@ -140,7 +140,7 @@ THD = sqrt(Σ A_h² for h=2..10) / A_1 × 100%
 | LPUART1 | Interrupt-driven TX | PC telemetry @ 209,700 bps |
 | I2C1 | DMA-driven @ 400 kHz | SSD1306 OLED display |
 
-### UART Ping-Pong TX System *(Gopika)*
+### UART Ping-Pong TX System 
 Two 2048-byte buffers allow the main loop to assemble the next frame while HAL transmits the previous one — **no blocking delays**.
 
 ```c
