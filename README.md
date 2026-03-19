@@ -1,6 +1,6 @@
 <!-- BANNER — replace the image below with your project banner (recommended: 1280×400 px) -->
 <div align="center">
-  <img src="assets/banner.png" alt="Zaplytics Banner" width="100%" />
+  <img src="Banner_zap.png" alt="Zaplytics Banner" width="100%" />
 </div>
 
 <br/>
